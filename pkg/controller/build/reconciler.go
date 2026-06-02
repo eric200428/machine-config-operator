@@ -1390,6 +1390,13 @@ func (b *buildReconciler) reconcilePoolChange(ctx context.Context, mcp *mcfgv1.M
 	// In both cases, we need to create/continue a build
 	missingAnnotation := firstOptIn == ""
 
+	// No action needed if the rendered config hasn't changed.
+	// Prevents unnecessary builds when MCs are reapplied with identical content.
+	if oldRendered == newRendered {
+		klog.V(4).Infof("pool %q: Configuration unchanged (%s), no action needed", mcp.Name, oldRendered)
+		return nil
+	}
+
 	// This is our trigger point
 	// Create/continue a build if:
 	// 1. Config changed AND needs image rebuild, OR
