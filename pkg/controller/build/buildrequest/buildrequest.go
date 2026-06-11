@@ -10,6 +10,7 @@ import (
 
 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
 	mcfgclientset "github.com/openshift/client-go/machineconfiguration/clientset/versioned"
+	parser "github.com/openshift/imagebuilder/dockerfile/parser"
 	"github.com/openshift/machine-config-operator/pkg/controller/build/constants"
 	"github.com/openshift/machine-config-operator/pkg/controller/build/utils"
 	chelpers "github.com/openshift/machine-config-operator/pkg/controller/common"
@@ -39,6 +40,22 @@ const (
 	machineConfigJSONFilename string = "machineconfig.json.gz"
 )
 
+// instructionRequirements maps Containerfile instructions that MUST have arguments to their requirement descriptions
+// Instructions not in this map either don't require arguments or have optional arguments
+var instructionRequirements = map[string]string{
+	"FROM":    "a base image",
+	"RUN":     "a command",
+	"COPY":    "source and destination paths",
+	"ADD":     "source and destination paths",
+	"WORKDIR": "a directory path",
+	"USER":    "a username or UID",
+	"ARG":     "a variable name",
+	"ENV":     "key=value pairs",
+	"LABEL":   "key=value pairs",
+	"EXPOSE":  "a port",
+	"VOLUME":  "a mount point",
+}
+
 // Represents the request to build a layered OS image.
 type buildRequestImpl struct {
 	opts              BuildRequestOpts
@@ -66,6 +83,13 @@ func newBuildRequest(opts BuildRequestOpts) BuildRequest {
 		if file.ContainerfileArch == mcfgv1.NoArch {
 			br.userContainerfile = file.Content
 			break
+		}
+	}
+
+	// Validate user's Containerfile if provided
+	if br.userContainerfile != "" {
+		if err := br.validateContainerfileSyntax(br.userContainerfile); err != nil {
+			klog.Warningf("User Containerfile validation failed: %v", err)
 		}
 	}
 
@@ -346,7 +370,142 @@ func (br buildRequestImpl) renderContainerfile() (string, error) {
 		return "", fmt.Errorf("could not execute containerfile template: %w", err)
 	}
 
-	return out.String(), nil
+	renderedContainerfile := out.String()
+
+	// Validate the rendered Containerfile
+	if err := br.validateContainerfileSyntax(renderedContainerfile); err != nil {
+		return "", fmt.Errorf("rendered containerfile validation failed: %w", err)
+	}
+
+	return renderedContainerfile, nil
+}
+
+func (br buildRequestImpl) validateContainerfileSyntax(containerfile string) error {
+	if containerfile == "" {
+		return fmt.Errorf("containerfile is empty")
+	}
+
+	if err := br.validateBasicSyntax(containerfile); err != nil {
+		return err
+	}
+
+	result, err := parser.Parse(strings.NewReader(containerfile))
+	if err != nil {
+		// For rendered templates, advanced syntax is expected
+		// Only fail on obvious syntax errors
+		if !isKnownAdvancedSyntaxError(err) {
+			return fmt.Errorf("failed to parse Containerfile: %w", err)
+		}
+		// Log but don't fail for advanced syntax
+		klog.V(4).Infof("Containerfile uses advanced syntax, skipping detailed parser validation: %v", err)
+		return nil
+	}
+
+	if result.AST == nil || len(result.AST.Children) == 0 {
+		return fmt.Errorf("parsed Containerfile has no instructions")
+	}
+
+	// Validate each instruction
+	for _, child := range result.AST.Children {
+		if err := br.validateInstruction(child); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateBasicSyntax performs basic sanity checks that don't require parsing
+func (br buildRequestImpl) validateBasicSyntax(containerfile string) error {
+	// Check for at least one FROM instruction
+	lines := strings.Split(containerfile, "\n")
+	hasFrom := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Skip empty lines and comments
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		// Check for FROM instruction (case-insensitive)
+		upperLine := strings.ToUpper(trimmed)
+		if strings.HasPrefix(upperLine, "FROM ") || upperLine == "FROM" {
+			hasFrom = true
+			break
+		}
+	}
+
+	if !hasFrom {
+		return fmt.Errorf("Containerfile must contain at least one FROM instruction")
+	}
+
+	return nil
+}
+
+// isKnownAdvancedSyntaxError checks if a parser error is from known advanced Dockerfile syntax
+// that the parser doesn't support but is valid in buildah/podman
+func isKnownAdvancedSyntaxError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := err.Error()
+	knownPatterns := []string{
+		"can't find = in",                 // Heredoc and ARG/ENV parsing issues
+		"must be of the form: name=value", // ARG/ENV syntax the parser doesn't handle
+
+	}
+
+	for _, pattern := range knownPatterns {
+		if strings.Contains(errMsg, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Valid Dockerfile instructions (comprehensive list including multi-stage build and advanced features)
+var validInstructions = map[string]bool{
+	"FROM": true, "RUN": true, "CMD": true, "LABEL": true, "EXPOSE": true,
+	"ENV": true, "ADD": true, "COPY": true, "ENTRYPOINT": true, "VOLUME": true,
+	"USER": true, "WORKDIR": true, "ARG": true, "ONBUILD": true, "STOPSIGNAL": true,
+	"HEALTHCHECK": true, "SHELL": true, "MAINTAINER": true,
+}
+
+// validateInstruction validates that an instruction is valid and has required arguments
+func (br buildRequestImpl) validateInstruction(node *parser.Node) error {
+	if node == nil || len(node.Value) == 0 {
+		return nil
+	}
+
+	instruction := strings.ToUpper(node.Value)
+
+	// First check if this is a valid Dockerfile instruction
+	if !validInstructions[instruction] {
+		return fmt.Errorf("unknown Dockerfile instruction: %s", instruction)
+	}
+
+	// Then check if it has required arguments
+	requirement, requiresArgs := instructionRequirements[instruction]
+	if requiresArgs {
+		// Check if the node has arguments
+		hasArgs := false
+		if node.Next != nil && len(node.Next.Value) > 0 {
+			hasArgs = true
+		}
+		// Also check if there's a raw attribute that contains args
+		if !hasArgs && node.Attributes != nil && len(node.Attributes) > 0 {
+			hasArgs = true
+		}
+
+		if !hasArgs {
+			return fmt.Errorf("%s instruction requires %s", instruction, requirement)
+		}
+	}
+
+	return nil
 }
 
 // podToJob creates a Job with the spec of the given Pod
