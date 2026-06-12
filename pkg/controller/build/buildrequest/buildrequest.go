@@ -476,7 +476,7 @@ var validInstructions = map[string]bool{
 
 // validateInstruction validates that an instruction is valid and has required arguments
 func (br buildRequestImpl) validateInstruction(node *parser.Node) error {
-	if node == nil || len(node.Value) == 0 {
+	if node == nil || node.Value == "" {
 		return nil
 	}
 
@@ -492,7 +492,7 @@ func (br buildRequestImpl) validateInstruction(node *parser.Node) error {
 	if requiresArgs {
 		// Check if the node has arguments
 		hasArgs := false
-		if node.Next != nil && len(node.Next.Value) > 0 {
+		if node.Next != nil && node.Next.Value != "" {
 			hasArgs = true
 		}
 		// Also check if there's a raw attribute that contains args
