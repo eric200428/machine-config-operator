@@ -26,6 +26,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
@@ -61,28 +62,30 @@ type reconciler interface {
 // is to respond to incoming events in a specific way. By doing this, the
 // reconciliation process has a clear entrypoint for each incoming event.
 type buildReconciler struct {
-	mcfgclient  mcfgclientset.Interface
-	kubeclient  clientset.Interface
-	imageclient imagev1clientset.Interface
-	routeclient routeclientset.Interface
-	imagepruner imagepruner.ImagePruner
+	mcfgclient    mcfgclientset.Interface
+	kubeclient    clientset.Interface
+	imageclient   imagev1clientset.Interface
+	routeclient   routeclientset.Interface
+	imagepruner   imagepruner.ImagePruner
+	eventRecorder *OCLEventRecorder
 	*listers
 }
 
 // Instantiates a new reconciler instance. This returns an interface to
 // disallow access to its private methods.
-func newBuildReconciler(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, imageclient imagev1clientset.Interface, routeclient routeclientset.Interface, l *listers, imagepruner imagepruner.ImagePruner) reconciler {
-	return newBuildReconcilerAsStruct(mcfgclient, kubeclient, imageclient, routeclient, l, imagepruner)
+func newBuildReconciler(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, imageclient imagev1clientset.Interface, routeclient routeclientset.Interface, l *listers, imagepruner imagepruner.ImagePruner, eventRecorder record.EventRecorder) reconciler {
+	return newBuildReconcilerAsStruct(mcfgclient, kubeclient, imageclient, routeclient, l, imagepruner, eventRecorder)
 }
 
-func newBuildReconcilerAsStruct(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, imageclient imagev1clientset.Interface, routeclient routeclientset.Interface, l *listers, imagepruner imagepruner.ImagePruner) *buildReconciler {
+func newBuildReconcilerAsStruct(mcfgclient mcfgclientset.Interface, kubeclient clientset.Interface, imageclient imagev1clientset.Interface, routeclient routeclientset.Interface, l *listers, imagepruner imagepruner.ImagePruner, eventRecorder record.EventRecorder) *buildReconciler {
 	return &buildReconciler{
-		mcfgclient:  mcfgclient,
-		kubeclient:  kubeclient,
-		imageclient: imageclient,
-		routeclient: routeclient,
-		imagepruner: imagepruner,
-		listers:     l,
+		mcfgclient:    mcfgclient,
+		kubeclient:    kubeclient,
+		imageclient:   imageclient,
+		routeclient:   routeclient,
+		imagepruner:   imagepruner,
+		eventRecorder: NewOCLEventRecorder(eventRecorder),
+		listers:       l,
 	}
 }
 
@@ -219,6 +222,17 @@ func (b *buildReconciler) AddJob(ctx context.Context, job *batchv1.Job) error {
 	return b.timeObjectOperation(job, addingVerb, func() error {
 		klog.Infof("Adding build job %q", job.Name)
 
+		// Get the associated MachineOSBuild to record events
+		mosb, err := b.getMachineOSBuildForJob(job)
+		if err == nil && mosb != nil {
+			mosc, err := utils.GetMachineOSConfigForMachineOSBuild(mosb, b.utilListers())
+			if err == nil {
+				poolName := mosc.Spec.MachineConfigPool.Name
+				b.eventRecorder.RecordJobCreated(mosb, job)
+				RecordBuildJobState(poolName, mosb.Name, job.Name, "active")
+			}
+		}
+
 		if err := b.updateMachineOSBuildWithStatus(ctx, job); err != nil {
 			return fmt.Errorf("could not update job status for %q: %w", job.Name, err)
 		}
@@ -230,6 +244,36 @@ func (b *buildReconciler) AddJob(ctx context.Context, job *batchv1.Job) error {
 // Executes whenever a build Job is updated
 func (b *buildReconciler) UpdateJob(ctx context.Context, oldJob, curJob *batchv1.Job) error {
 	return b.timeObjectOperation(curJob, updatingVerb, func() error {
+		// Record job state transitions
+		mosb, err := b.getMachineOSBuildForJob(curJob)
+		if err == nil && mosb != nil {
+			mosc, err := utils.GetMachineOSConfigForMachineOSBuild(mosb, b.utilListers())
+			if err == nil {
+				poolName := mosc.Spec.MachineConfigPool.Name
+
+				// Check for job completion
+				if curJob.Status.Succeeded > 0 && (oldJob.Status.Succeeded == 0) {
+					b.eventRecorder.RecordJobCompleted(mosb, curJob)
+					RecordBuildJobState(poolName, mosb.Name, curJob.Name, StateSucceeded)
+				}
+
+				// Check for job failure
+				if curJob.Status.Failed > 0 && (oldJob.Status.Failed == 0) {
+					failureReason := "Job failed"
+					if len(curJob.Status.Conditions) > 0 {
+						failureReason = curJob.Status.Conditions[0].Message
+					}
+					b.eventRecorder.RecordJobFailed(mosb, curJob, failureReason)
+					RecordBuildJobState(poolName, mosb.Name, curJob.Name, StateFailed)
+				}
+
+				// Check for job start (active pods)
+				if curJob.Status.Active > 0 && (oldJob.Status.Active == 0) {
+					b.eventRecorder.RecordJobStarted(mosb, curJob)
+				}
+			}
+		}
+
 		return b.updateMachineOSBuildWithStatusIfNeeded(ctx, oldJob, curJob)
 	})
 }
@@ -237,10 +281,16 @@ func (b *buildReconciler) UpdateJob(ctx context.Context, oldJob, curJob *batchv1
 // Executes whenever a build Job is deleted
 func (b *buildReconciler) DeleteJob(ctx context.Context, job *batchv1.Job) error {
 	return b.timeObjectOperation(job, deletingVerb, func() error {
+		// Record job deletion event
+		mosb, err := b.getMachineOSBuildForJob(job)
+		if err == nil && mosb != nil {
+			b.eventRecorder.RecordJobDeleted(mosb, job.Name)
+		}
+
 		// Set the DeletionTimestamp so that we can set the build status to interrupted
 		job.SetDeletionTimestamp(&metav1.Time{Time: time.Now()})
 
-		err := b.updateMachineOSBuildWithStatus(ctx, job)
+		err = b.updateMachineOSBuildWithStatus(ctx, job)
 		if err != nil {
 			return err
 		}
@@ -287,13 +337,37 @@ func (b *buildReconciler) updateMachineOSBuild(ctx context.Context, old, current
 		return nil
 	}
 
+	poolName := mosc.Spec.MachineConfigPool.Name
+
 	if !oldState.IsBuildFailure() && curState.IsBuildFailure() {
 		klog.Infof("MachineOSBuild %s failed, leaving ephemeral objects in place for inspection", current.Name)
+
+		// Get failure reason from conditions
+		failureReason := "Unknown"
+		if apihelpers.IsMachineOSBuildConditionTrue(current.Status.Conditions, mcfgv1.MachineOSBuildFailed) {
+			for _, cond := range current.Status.Conditions {
+				if cond.Type == string(mcfgv1.MachineOSBuildFailed) && cond.Status == metav1.ConditionTrue {
+					failureReason = cond.Message
+					break
+				}
+			}
+		}
+
+		// Record build failure event and metrics
+		b.eventRecorder.RecordBuildFailed(current, failureReason)
+		if old.CreationTimestamp.Time.IsZero() {
+			RecordBuildFailed(poolName, current.Name, time.Now())
+		} else {
+			RecordBuildFailed(poolName, current.Name, old.CreationTimestamp.Time)
+		}
 
 		mcp, err := b.machineConfigPoolLister.Get(mosc.Spec.MachineConfigPool.Name)
 		if err != nil {
 			return fmt.Errorf("could not get MachineConfigPool from MachineOSConfig %q: %w", mosc.Name, err)
 		}
+
+		// Record build degraded event
+		b.eventRecorder.RecordBuildDegraded(mosc, mcp, failureReason)
 
 		// Always update ImageBuildDegraded condition based on current active build status
 		return b.updateImageBuildDegradedCondition(ctx, mcp, mosc)
@@ -305,6 +379,14 @@ func (b *buildReconciler) updateMachineOSBuild(ctx context.Context, old, current
 	if !oldState.IsBuildSuccess() && curState.IsBuildSuccess() {
 		klog.Infof("MachineOSBuild %s succeeded, cleaning up all ephemeral objects used for the build", current.Name)
 
+		// Record build completion event and metrics
+		b.eventRecorder.RecordBuildCompleted(current, string(current.Status.DigestedImagePushSpec))
+		if old.CreationTimestamp.Time.IsZero() {
+			RecordBuildCompleted(poolName, current.Name, time.Now())
+		} else {
+			RecordBuildCompleted(poolName, current.Name, old.CreationTimestamp.Time)
+		}
+
 		mcp, err := b.machineConfigPoolLister.Get(mosc.Spec.MachineConfigPool.Name)
 		if err != nil {
 			return fmt.Errorf("could not get MachineConfigPool from MachineOSConfig %q: %w", mosc.Name, err)
@@ -315,10 +397,17 @@ func (b *buildReconciler) updateMachineOSBuild(ctx context.Context, old, current
 			klog.Errorf("Failed to update ImageBuildDegraded condition for pool %s: %v", mcp.Name, err)
 		}
 
+		// Record cleanup started event
+		b.eventRecorder.RecordCleanupStarted(current)
+
 		// Clean up ephemeral objects
 		if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, current, mosc).Clean(ctx); err != nil {
+			b.eventRecorder.RecordCleanupFailed(current, err.Error())
 			return err
 		}
+
+		// Record cleanup completed event
+		b.eventRecorder.RecordCleanupCompleted(current)
 
 		if err := b.updateMachineOSConfigStatus(ctx, mosc, current); err != nil {
 			return fmt.Errorf("could not update MachineOSConfig %q status for successful MachineOSBuild %q: %w", mosc.Name, current.Name, err)
@@ -430,6 +519,11 @@ func (b *buildReconciler) UpdateMachineConfigPool(ctx context.Context, oldMCP, c
 func (b *buildReconciler) updateMachineConfigPool(ctx context.Context, oldMCP, curMCP *mcfgv1.MachineConfigPool) error {
 	if oldMCP.Spec.Configuration.Name != curMCP.Spec.Configuration.Name {
 		klog.Infof("Rendered config for pool %s changed from %s to %s", curMCP.Name, oldMCP.Spec.Configuration.Name, curMCP.Spec.Configuration.Name)
+
+		// Record config change event and metrics
+		b.eventRecorder.RecordPoolConfigChanged(curMCP, oldMCP.Spec.Configuration.Name, curMCP.Spec.Configuration.Name)
+		RecordConfigChange(curMCP.Name)
+
 		if err := b.reconcilePoolChange(ctx, curMCP); err != nil {
 			return fmt.Errorf("could not create or reuse existing MachineOSBuild for MachineConfigPool %q change: %w", curMCP.Name, err)
 		}
@@ -450,10 +544,16 @@ func (b *buildReconciler) startBuild(ctx context.Context, mosb *mcfgv1.MachineOS
 		return err
 	}
 
+	poolName := mosc.Spec.MachineConfigPool.Name
+
 	// If there are any other in-progress builds for this MachineOSConfig, stop them first.
 	if err := b.deleteOtherBuildsForMachineOSConfig(ctx, mosb, mosc); err != nil {
 		return fmt.Errorf("could not delete other non-terminal MachineOSBuilds for MachineOSConfig %s: %w", mosc.Name, err)
 	}
+
+	// Record build started event and metrics
+	b.eventRecorder.RecordBuildStarted(mosb, mosc)
+	RecordBuildStarted(poolName, mosb.Name)
 
 	// Next, create our new MachineOSBuild.
 	if err := imagebuilder.NewJobImageBuilder(b.kubeclient, b.mcfgclient, mosb, mosc).Start(ctx); err != nil {
@@ -488,6 +588,16 @@ func (b *buildReconciler) getMachineOSConfigForUpdate(mosc *mcfgv1.MachineOSConf
 	}
 
 	return out.DeepCopy(), nil
+}
+
+// Retrieves the MachineOSBuild associated with a Job based on labels
+func (b *buildReconciler) getMachineOSBuildForJob(job *batchv1.Job) (*mcfgv1.MachineOSBuild, error) {
+	if !metav1.HasLabel(job.ObjectMeta, constants.MachineOSBuildNameLabelKey) {
+		return nil, fmt.Errorf("job %q does not have MachineOSBuild label", job.Name)
+	}
+
+	mosbName := job.Labels[constants.MachineOSBuildNameLabelKey]
+	return b.machineOSBuildLister.Get(mosbName)
 }
 
 // Retrieves a deep-copy of the MachineOSBuild from the lister so that the cache is not mutated during the update.
