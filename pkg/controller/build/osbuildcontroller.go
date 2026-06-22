@@ -153,11 +153,6 @@ func newOSBuildController(
 	ctrl.shutdownDelayHandler = newShutdownDelayHandler(ctrl.listers)
 	ctrl.shutdownChan = make(chan struct{})
 
-	// Register OCL metrics
-	if err := RegisterOCLMetrics(); err != nil {
-		klog.Warningf("Failed to register OCL metrics: %v", err)
-	}
-
 	return ctrl
 }
 
